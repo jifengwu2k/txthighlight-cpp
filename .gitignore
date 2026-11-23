@@ -1,0 +1,14 @@
+# Build output
+/txthighlight
+/txthighlight.o
+*.o
+*.dSYM/
+
+# Annotation sidecars created by serving this repository
+/*.json
+*.json.tmp
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~
