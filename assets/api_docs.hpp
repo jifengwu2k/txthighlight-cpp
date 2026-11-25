@@ -55,8 +55,9 @@ inline constexpr std::string_view directory_api_docs =
 <table>
   <thead><tr><th>Method</th><th>Endpoint</th><th>What it does</th></tr></thead>
   <tbody>
-    <tr><td><code>GET</code></td><td><code>/</code>, <code>/subdir/</code></td><td>This listing. Each row links to its annotation view and carries a Download link.</td></tr>
-    <tr><td><code>GET</code></td><td><code>/notes.txt</code>, <code>/photo.png</code></td><td>Download the original file, unchanged.</td></tr>
+    <tr><td><code>GET</code>, <code>HEAD</code></td><td><code>/</code>, <code>/subdir/</code></td><td>This listing. Each row links to its annotation view and carries a Download link.</td></tr>
+    <tr><td><code>GET</code>, <code>HEAD</code></td><td><code>/notes.txt</code>, <code>/photo.png</code></td><td>Download the original file, unchanged. Supports HTTP Range requests.</td></tr>
+    <tr><td><code>POST</code></td><td><code>/subdir/</code></td><td>Upload one or more files with <code>multipart/form-data</code>; answers <code>303 See Other</code> back to the directory.</td></tr>
     <tr><td><code>GET</code></td><td><code>/annotate?path=%2Fnotes.txt</code></td><td>Annotation UI for one file: text or image, chosen from the file's content.</td></tr>
   </tbody>
 </table>
@@ -68,11 +69,37 @@ curl -O 'http://127.0.0.1:8000/photo.png'           # original file</code></pre>
   downloads; only its annotation view is unavailable.
 </p>
 
+<h3>Resumable downloads</h3>
+<p>
+  File responses carry <code>Accept-Ranges: bytes</code>. A <code>Range</code>
+  request returns <code>206 Partial Content</code> with
+  <code>Content-Range</code>; an unsatisfiable range returns <code>416</code>
+  with <code>Content-Range: bytes */&lt;size&gt;</code>. Downloads are streamed,
+  so file size is not limited by memory.
+</p>
+<pre><code>curl -O -C - 'http://127.0.0.1:8000/large.bin'      # resume automatically
+curl -H 'Range: bytes=0-1023' 'http://127.0.0.1:8000/large.bin'
+curl -I 'http://127.0.0.1:8000/large.bin'           # size and range support</code></pre>
+
+<h3>Uploads</h3>
+<p>
+  <code>POST</code> to any directory with <code>multipart/form-data</code>.
+  Every part with a filename is streamed straight to disk and renamed into
+  place when complete, so a dropped upload never replaces an existing file with
+  a truncated one. Only the final path component of a filename is used.
+</p>
+<pre><code>curl -X POST \
+  -F 'file=@/path/to/photo.jpg' \
+  -F 'file=@/path/to/document.pdf' \
+  'http://127.0.0.1:8000/subdir/'</code></pre>
+
 <h3>Errors</h3>
 <p>
-  <code>{"error": "message"}</code> with <code>404</code> for a missing path,
-  <code>500</code> for a filesystem failure, and <code>501</code> for methods
-  other than <code>GET</code> and <code>POST</code>.
+  <code>{"error": "message"}</code> with <code>400</code> for a malformed
+  multipart body or invalid upload filename, <code>404</code> for a missing
+  path, <code>416</code> for an unsatisfiable range, <code>500</code> for a
+  filesystem failure, and <code>501</code> for methods other than
+  <code>GET</code>, <code>HEAD</code>, and <code>POST</code>.
 </p>
 </section>)TXTHTML";
 

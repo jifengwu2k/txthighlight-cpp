@@ -66,14 +66,30 @@ namespace {
 // ---------------------------------------------------------------------------
 
 constexpr int http_ok = 200;
+constexpr int http_see_other = 303;
 constexpr int http_bad_request = 400;
 constexpr int http_not_found = 404;
+constexpr int http_range_not_satisfiable = 416;
 constexpr int http_internal_server_error = 500;
 
 constexpr const char *server_version = "TextHighlighter/1.2";
 
 constexpr std::string_view text_annotations_route = "/api/annotations/text";
 constexpr std::string_view image_annotations_route = "/api/annotations/image";
+
+// Downloads are streamed through a provider, so this is the most that is ever
+// held in memory for one connection.
+constexpr std::size_t download_chunk_bytes = 256 * 1024;
+
+// Annotation documents are small. The server accepts uploads of any size, so
+// this limit is enforced only for the JSON request bodies of the annotation
+// API.
+constexpr std::size_t max_json_body_bytes = 8 * 1024 * 1024;
+
+// An in-progress upload is written to a hidden file next to its destination
+// and renamed atomically when the part ends. The directory listing hides files
+// carrying this prefix so a concurrent browser never sees half a file.
+constexpr std::string_view upload_temporary_prefix = ".txthighlight-upload-";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -219,6 +235,17 @@ std::string uri_path_from_components(const std::vector<std::string> &components,
     }
     if (force_directory && path.back() != '/') path.push_back('/');
     return path;
+}
+
+// The inverse of AppState::filesystem_path_from_uri_path(), used when a
+// handler redirects back to a directory it resolved itself.
+std::string uri_path_from_filesystem_path(const fs::path &root, const fs::path &path) {
+    const auto relative = path.lexically_relative(root);
+    if (relative.empty() || relative == ".") return "/";
+
+    std::vector<std::string> components;
+    for (const auto &component : relative) components.push_back(component.string());
+    return uri_path_from_components(components, true);
 }
 
 // A blank query value means "no path", so "?path=" behaves like no path.
@@ -1642,13 +1669,68 @@ void send_html(httplib::Response &response, std::string body, int status = http_
     response.set_content(std::move(body), "text/html; charset=utf-8");
 }
 
+// A file opened for one response. cpp-httplib asks for a range byte at a time
+// by offset, so one stream is opened and seeked between provider calls.
+class DownloadStream {
+  public:
+    explicit DownloadStream(const fs::path &path) : input_(path, std::ios::binary) {
+        if (!input_) throw std::runtime_error("Cannot read file: " + path.string());
+    }
+
+    DownloadStream(const DownloadStream &) = delete;
+    DownloadStream &operator=(const DownloadStream &) = delete;
+
+    bool write_next(std::size_t offset, std::size_t length, httplib::DataSink &sink) {
+        input_.clear();
+        input_.seekg(static_cast<std::streamoff>(offset));
+        if (!input_) return false;
+
+        std::vector<char> buffer(std::min(length, download_chunk_bytes));
+        input_.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto read = input_.gcount();
+        if (read <= 0) return false;
+        return sink.write(buffer.data(), static_cast<std::size_t>(read));
+    }
+
+  private:
+    std::ifstream input_;
+};
+
+// Recorded on a response so the post-routing handler can describe the whole
+// representation in a 416 Content-Range ("bytes */<size>").
+struct DownloadSize {
+    std::size_t bytes;
+};
+
+// The original file is streamed, never read into memory. Leaving the response
+// status unset lets cpp-httplib answer a valid Range request with 206 and feed
+// the provider the requested offsets; a file too short for the range becomes a
+// 416.
 void send_file(httplib::Response &response, const fs::path &path) {
-    const auto filename = path.filename().string();
-    response.status = http_ok;
+    std::error_code error;
+    const auto file_size = fs::file_size(path, error);
+    if (error) throw std::runtime_error("Cannot read file: " + path.string());
+
     response.set_header(
         "Content-Disposition",
-        std::format("attachment; filename*=UTF-8''{}", percent_encode(filename)));
-    response.set_content(read_file(path), "application/octet-stream");
+        std::format("attachment; filename*=UTF-8''{}",
+                    percent_encode(path.filename().string())));
+    response.set_header("Accept-Ranges", "bytes");
+    response.user_data.set("download-size", DownloadSize{static_cast<std::size_t>(file_size)});
+
+    if (file_size == 0) {
+        // A zero-length provider needs an explicit end marker; a plain empty
+        // body is the simpler representation of an empty file.
+        response.set_content(std::string{}, "application/octet-stream");
+        return;
+    }
+
+    auto stream = std::make_shared<DownloadStream>(path);
+    response.set_content_provider(
+        static_cast<std::size_t>(file_size), "application/octet-stream",
+        [stream](std::size_t offset, std::size_t length, httplib::DataSink &sink) {
+            return stream->write_next(offset, length, sink);
+        });
 }
 
 // Runs a handler, turning any escaping error into the right JSON error body.
@@ -1663,6 +1745,138 @@ template <class Handler> void respond(httplib::Response &response, Handler &&han
         send_error_json(response, error.what(), http_internal_server_error);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Streaming uploads
+// ---------------------------------------------------------------------------
+
+bool is_upload_temporary_name(std::string_view name) {
+    return name.starts_with(upload_temporary_prefix);
+}
+
+// An uploaded filename may arrive with a client-side directory attached (some
+// browsers send the full path). Keep only the last component and refuse the
+// names that could still escape the upload directory.
+std::optional<std::string> sanitized_upload_name(std::string_view filename) {
+    std::string normalized(filename);
+    std::ranges::replace(normalized, '\\', '/');
+    if (const auto slash = normalized.rfind('/'); slash != std::string::npos) {
+        normalized.erase(0, slash + 1);
+    }
+    if (normalized.empty() || normalized == "." || normalized == "..") return std::nullopt;
+    if (normalized.find('\0') != std::string::npos) return std::nullopt;
+    return normalized;
+}
+
+// One file part of an upload. The bytes go to a hidden temporary file next to
+// the destination; commit() atomically replaces the destination, while the
+// destructor removes the temporary file if the part never completes.
+class UploadPart {
+  public:
+    UploadPart(fs::path temporary, fs::path destination)
+        : temporary_(std::move(temporary)), destination_(std::move(destination)) {
+        output_.open(temporary_, std::ios::binary | std::ios::trunc);
+        if (!output_) {
+            std::error_code ignored;
+            fs::remove(temporary_, ignored);
+            throw std::runtime_error("Cannot create an upload in " +
+                                     temporary_.parent_path().string());
+        }
+    }
+
+    UploadPart(const UploadPart &) = delete;
+    UploadPart &operator=(const UploadPart &) = delete;
+
+    ~UploadPart() {
+        if (committed_) return;
+        output_.close();
+        std::error_code ignored;
+        fs::remove(temporary_, ignored);
+    }
+
+    void write(const char *data, std::size_t length) {
+        output_.write(data, static_cast<std::streamsize>(length));
+        if (!output_) {
+            throw std::runtime_error("Cannot write uploaded file: " + destination_.string());
+        }
+    }
+
+    void commit() {
+        output_.close();
+        if (!output_) {
+            throw std::runtime_error("Cannot finish uploaded file: " + destination_.string());
+        }
+
+        std::error_code error;
+        fs::rename(temporary_, destination_, error);
+        if (error) {
+            throw std::runtime_error("Cannot save uploaded file: " + destination_.string());
+        }
+        committed_ = true;
+    }
+
+  private:
+    fs::path temporary_;
+    fs::path destination_;
+    std::ofstream output_;
+    bool committed_ = false;
+};
+
+// Receives the events of one multipart/form-data request. Only the current
+// UploadPart and the multipart parser's boundary window are ever in memory.
+class UploadWriter {
+  public:
+    explicit UploadWriter(fs::path directory) : directory_(std::move(directory)) {}
+
+    UploadWriter(const UploadWriter &) = delete;
+    UploadWriter &operator=(const UploadWriter &) = delete;
+
+    bool begin_part(const httplib::FormData &part) {
+        finish_part();
+        if (part.filename.empty()) {
+            // A non-file form field has no filename; an empty file input sends
+            // filename="". Neither names a file, so both are consumed and
+            // ignored rather than rejected.
+            return true;
+        }
+
+        const auto name = sanitized_upload_name(part.filename);
+        if (!name) throw BadRequestError("Invalid upload filename: " + part.filename);
+
+        const auto destination = directory_ / *name;
+        std::error_code error;
+        if (fs::is_directory(destination, error)) {
+            throw BadRequestError("Cannot overwrite a directory: " + *name);
+        }
+
+        current_part_.emplace(temporary_path(), destination);
+        return true;
+    }
+
+    bool write_part(const char *data, std::size_t length) {
+        if (current_part_) current_part_->write(data, length);
+        return true;
+    }
+
+    void finish_part() {
+        if (!current_part_) return;
+        current_part_->commit();
+        current_part_.reset();
+        ++uploaded_count_;
+    }
+
+    [[nodiscard]] std::int64_t uploaded_count() const noexcept { return uploaded_count_; }
+
+  private:
+    fs::path temporary_path() const {
+        return directory_ /
+               std::format("{}{}.part", upload_temporary_prefix, new_uuid());
+    }
+
+    fs::path directory_;
+    std::optional<UploadPart> current_part_;
+    std::int64_t uploaded_count_ = 0;
+};
 
 // ---------------------------------------------------------------------------
 // Directory listing
@@ -1788,6 +2002,7 @@ std::string render_directory_listing(AppState &state, std::string_view raw_uri_p
     for (const auto &entry : entries) {
         const auto entry_path = entry.path();
         const auto entry_name = entry_path.filename().string();
+        if (is_upload_temporary_name(entry_name)) continue;
         std::error_code error;
         const auto is_directory = entry.is_directory(error);
         const auto is_sidecar = is_sidecar_metadata_file(entry_path);
@@ -1930,27 +2145,82 @@ void handle_get(AppState &state, const httplib::Request &request, httplib::Respo
     });
 }
 
-void handle_post(AppState &state, const httplib::Request &request, httplib::Response &response) {
+std::string read_annotation_body(const httplib::ContentReader &content_reader) {
+    std::string body;
+    const bool read_ok = content_reader([&body](const char *data, std::size_t length) {
+        if (body.size() > max_json_body_bytes || length > max_json_body_bytes - body.size()) {
+            throw BadRequestError("Annotation request body is too large");
+        }
+        body.append(data, length);
+        return true;
+    });
+    if (!read_ok) throw BadRequestError("Cannot read the request body");
+    return body;
+}
+
+json parse_annotation_payload(std::string_view body) {
+    if (body.empty()) return json::object();
+
+    json payload;
+    try {
+        payload = json::parse(body);
+    } catch (const json::parse_error &error) {
+        throw BadRequestError(std::format("Invalid JSON body at byte {}", error.byte));
+    }
+    if (!payload.is_object()) {
+        throw BadRequestError("Request body must be a JSON object");
+    }
+    return payload;
+}
+
+void handle_upload(AppState &state, const RequestTarget &target,
+                   const httplib::Request &request, httplib::Response &response,
+                   const httplib::ContentReader &content_reader) {
+    if (!request.is_multipart_form_data()) {
+        throw BadRequestError("Uploads must use multipart/form-data");
+    }
+
+    const auto directory_path = state.filesystem_path_from_uri_path(target.path);
+    std::error_code error;
+    if (!directory_path || !fs::is_directory(*directory_path, error)) {
+        throw RequestNotFoundError("Upload directory not found: " + target.path);
+    }
+
+    UploadWriter writer(*directory_path);
+    const bool read_ok = content_reader(
+        [&writer](const httplib::FormData &part) { return writer.begin_part(part); },
+        [&writer](const char *data, std::size_t length) {
+            return writer.write_part(data, length);
+        });
+    if (!read_ok) throw BadRequestError("Malformed or incomplete multipart upload");
+
+    writer.finish_part();
+    if (writer.uploaded_count() == 0) throw BadRequestError("No files were uploaded");
+
+    // Redirect back to the directory, so a browser form submission ends on the
+    // refreshed listing instead of a blank result page.
+    response.status = http_see_other;
+    response.set_header(
+        "Location", uri_path_from_filesystem_path(state.root_path(), *directory_path));
+}
+
+void handle_post(AppState &state, const httplib::Request &request, httplib::Response &response,
+                 const httplib::ContentReader &content_reader) {
     const auto target = split_request_target(request.target);
     respond(response, [&] {
         const bool is_text = target.path == text_annotations_route;
         const bool is_image = target.path == image_annotations_route;
-        if (!is_text && !is_image) throw RequestNotFoundError("Not found");
+        if (!is_text && !is_image) {
+            handle_upload(state, target, request, response, content_reader);
+            return;
+        }
+
+        if (request.is_multipart_form_data()) {
+            throw BadRequestError("Annotation requests must be JSON, not multipart/form-data");
+        }
 
         const auto document_path = first_query_value(target.query, "path").value_or("/");
-
-        json payload = json::object();
-        if (!request.body.empty()) {
-            try {
-                payload = json::parse(request.body);
-            } catch (const json::parse_error &error) {
-                throw BadRequestError(std::format("Invalid JSON body at byte {}", error.byte));
-            }
-        }
-        if (!payload.is_object()) {
-            throw BadRequestError("Request body must be a JSON object");
-        }
-
+        const auto payload = parse_annotation_payload(read_annotation_body(content_reader));
         send_json(response, is_text ? state.mutate_text(document_path, payload)
                                     : state.mutate_image(document_path, payload));
     });
@@ -2014,13 +2284,34 @@ int serve(const std::string &raw_path, const std::string &host, int port, bool u
                    request.method, request.target, response.status);
     });
 
-    // Any method other than GET/POST is rejected with 501. GET and POST must
-    // fall through to real routes: the body is only read
-    // once routing completes, so a pre-routing handler would always see it empty.
+    // Uploads are streamed straight to disk, so the library's default 100 MiB
+    // request-body ceiling would cap them. The annotation API enforces its own
+    // much smaller JSON limit instead (see read_annotation_body).
+    server.set_payload_max_length(0);
+
+    // A 416 is generated by cpp-httplib while validating the Range header, so
+    // send_file records the representation length for us to report here.
+    server.set_post_routing_handler(
+        [](const httplib::Request &, httplib::Response &response) {
+            if (response.status != http_range_not_satisfiable) return;
+            const auto *download = response.user_data.get<DownloadSize>("download-size");
+            if (download == nullptr) return;
+            response.set_header("Content-Range",
+                                std::format("bytes */{}", download->bytes));
+        });
+
+    // HEAD is answered by the GET handler, with the body suppressed by the
+    // library. GET and POST must fall through to real routes: the body is only
+    // read once routing completes, so a pre-routing handler would always see
+    // it empty.
     server.set_pre_routing_handler(
-        [](const httplib::Request &request, httplib::Response &response) {
+        [&state](const httplib::Request &request, httplib::Response &response) {
             if (request.method == "GET" || request.method == "POST") {
                 return httplib::Server::HandlerResponse::Unhandled;
+            }
+            if (request.method == "HEAD") {
+                handle_get(state, request, response);
+                return httplib::Server::HandlerResponse::Handled;
             }
             response.status = 501;
             response.set_content("Unsupported method: " + request.method, "text/plain");
@@ -2029,9 +2320,12 @@ int serve(const std::string &raw_path, const std::string &host, int port, bool u
     server.Get(R"((.*))", [&state](const httplib::Request &request, httplib::Response &response) {
         handle_get(state, request, response);
     });
-    server.Post(R"((.*))", [&state](const httplib::Request &request, httplib::Response &response) {
-        handle_post(state, request, response);
-    });
+    server.Post(
+        R"((.*))",
+        [&state](const httplib::Request &request, httplib::Response &response,
+                 const httplib::ContentReader &content_reader) {
+            handle_post(state, request, response, content_reader);
+        });
 
     std::signal(SIGINT, handle_sigint);
     std::signal(SIGTERM, handle_sigint);

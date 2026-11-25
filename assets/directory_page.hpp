@@ -223,6 +223,63 @@ ul {{
   color: var(--muted);
 }}
 
+/* Multi-file upload; the browser submits one multipart/form-data request. */
+.upload {{
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}}
+
+.upload form {{
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}}
+
+.upload label {{
+  flex: 1 1 14rem;
+  font-size: 0.9rem;
+  font-weight: 500;
+}}
+
+.upload input[type="file"] {{
+  flex: 1 1 16rem;
+  min-width: 0;
+  font: inherit;
+  font-size: 0.875rem;
+}}
+
+.upload button {{
+  flex: 0 0 auto;
+  padding: 0.375rem 0.875rem;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+}}
+
+.upload button:hover {{
+  background: #0857cc;
+}}
+
+.upload button:focus-visible {{
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}}
+
+.upload-note {{
+  margin: 0.5rem 0 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}}
+
 footer p {{
   margin: 0;
   color: var(--muted);
@@ -271,11 +328,22 @@ footer p {{
 <ul>
 {2}</ul>
 <hr>
+<section class="upload" aria-label="Upload files">
+<form method="post" enctype="multipart/form-data" action="">
+<label for="upload-files">Upload files to this directory</label>
+<input id="upload-files" type="file" name="file" multiple required>
+<button type="submit">Upload</button>
+</form>
+<p class="upload-note">Large files are streamed to disk. Each file is written
+to a temporary file and renamed into place when its upload completes.</p>
+</section>
+<hr>
 <footer>
 <p>Open a file to annotate it, or use <strong>Download</strong> to save the
-original. Open a directory to keep browsing. This page is also the entry point
-for scripts and agents: the API documentation below covers browsing,
-downloading, and opening annotation views.</p>
+original (downloads support resuming with HTTP Range requests). Open a
+directory to keep browsing, or upload one or more files above. This page is
+also the entry point for scripts and agents: the API documentation below covers
+browsing, downloading, uploading, and opening annotation views.</p>
 </footer>
 <hr>
 <section class="api-docs-wrap">
