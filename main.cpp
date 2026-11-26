@@ -1244,13 +1244,10 @@ std::vector<TextAnnotation> remove_text_annotation(std::vector<TextAnnotation> a
     return annotations;
 }
 
-// Assigns ids to hand-written entries, drops ranges the text cannot hold, and
-// restores document order.
+// Drops ranges the text cannot hold and restores document order. Ids are minted
+// by load_annotations, which saves them, so no id is born here.
 std::vector<TextAnnotation> normalize_text_annotations(std::vector<TextAnnotation> annotations,
                                                        std::int64_t text_length) {
-    for (auto &annotation : annotations) {
-        if (annotation.id.empty()) annotation.id = new_uuid();
-    }
     std::erase_if(annotations, [text_length](const TextAnnotation &annotation) {
         return annotation.start < 0 || annotation.start >= annotation.end ||
                annotation.end > text_length;
@@ -1379,16 +1376,49 @@ std::vector<ImageAnnotation> remove_image_annotation(std::vector<ImageAnnotation
     return annotations;
 }
 
-// Sidecars can be hand-edited, so every stored annotation is validated and
-// given an id before it is used.
+// Sidecars can be hand-edited, so every stored annotation is validated before it
+// is used. Ids are minted by load_annotations, which saves them.
 std::vector<ImageAnnotation> normalize_image_annotations(std::vector<ImageAnnotation> annotations) {
     for (auto &annotation : annotations) {
-        std::visit([](auto &value) {
-            if (value.id.empty()) value.id = new_uuid();
-        }, annotation);
         validate_annotation(annotation);
     }
     return annotations;
+}
+
+// ---------------------------------------------------------------------------
+// Id stability
+//
+// Sidecars are hand-editable, so an entry may arrive without an id. An id minted
+// while answering a request only exists in that response: the next request would
+// mint a different one, and every update_comment or remove_id would fail with
+// "Unknown highlight id". Minting is therefore always paired with a save, so the
+// ids a client receives are the ids every later lookup compares against.
+// ---------------------------------------------------------------------------
+
+template <class Annotation> [[nodiscard]] bool assign_missing_id(Annotation &annotation) {
+    if (!annotation.id.empty()) return false;
+    annotation.id = new_uuid();
+    return true;
+}
+
+[[nodiscard]] bool assign_missing_ids(TextAnnotationDocument &document) {
+    bool minted = false;
+    for (auto &annotation : document.annotations) {
+        if (assign_missing_id(annotation)) minted = true;
+    }
+    return minted;
+}
+
+[[nodiscard]] bool assign_missing_ids(ImageAnnotationDocument &document) {
+    bool minted = false;
+    for (auto &annotation : document.annotations) {
+        std::visit(
+            [&minted](auto &value) {
+                if (assign_missing_id(value)) minted = true;
+            },
+            annotation);
+    }
+    return minted;
 }
 
 // ---------------------------------------------------------------------------
@@ -1519,7 +1549,7 @@ class AppState {
         }
 
         std::scoped_lock lock(mutex_);
-        auto annotations = read_annotations<TextAnnotationDocument>(text_path);
+        auto annotations = load_annotations<TextAnnotationDocument>(text_path);
         annotations.annotations =
             normalize_text_annotations(std::move(annotations.annotations),
                                        codepoint_length(text->bytes));
@@ -1531,7 +1561,7 @@ class AppState {
         require_raster_image(image_path);
 
         std::scoped_lock lock(mutex_);
-        auto document = read_annotations<ImageAnnotationDocument>(image_path);
+        auto document = load_annotations<ImageAnnotationDocument>(image_path);
         document.annotations = normalize_image_annotations(std::move(document.annotations));
         return json(document);
     }
@@ -1546,7 +1576,7 @@ class AppState {
         const auto text_length = codepoint_length(text->bytes);
 
         std::scoped_lock lock(mutex_);
-        auto document = read_annotations<TextAnnotationDocument>(text_path);
+        auto document = load_annotations<TextAnnotationDocument>(text_path);
         auto annotations =
             normalize_text_annotations(std::move(document.annotations), text_length);
 
@@ -1580,7 +1610,7 @@ class AppState {
         require_raster_image(image_path);
 
         std::scoped_lock lock(mutex_);
-        auto document = read_annotations<ImageAnnotationDocument>(image_path);
+        auto document = load_annotations<ImageAnnotationDocument>(image_path);
         auto annotations = normalize_image_annotations(std::move(document.annotations));
 
         const auto action = payload.value("action", std::string{"none"});
@@ -1652,6 +1682,15 @@ class AppState {
             return;
         }
         memory_documents_[source_path.string()] = AnnotationDocument{std::move(document)};
+    }
+
+    // Reads a sidecar and saves it straight back when ids had to be minted, so
+    // the ids returned to a client are the ids later mutations look up. A read
+    // of an already-identified sidecar writes nothing.
+    template <class Document> [[nodiscard]] Document load_annotations(const fs::path &source_path) {
+        auto document = read_annotations<Document>(source_path);
+        if (assign_missing_ids(document)) write_annotations(source_path, document);
+        return document;
     }
 
     mutable std::mutex mutex_;
