@@ -506,8 +506,11 @@ inline constexpr std::string_view image_page =
       return Math.min(maxLineWidth, Math.max(minLineWidth, value));
     }
 
+    // ?path= carries an already percent-encoded URI path (same form as the
+    // request path), so fetch it verbatim; re-encoding would double-escape
+    // non-ASCII names into %25.. and 404.
     const documentPath = new URLSearchParams(window.location.search).get('path') || '/';
-    const imageUrl = documentPath.split('/').map(encodeURIComponent).join('/') || '/';
+    const imageUrl = documentPath;
     const annotationsApiPath = `/api/annotations/image?path=${encodeURIComponent(documentPath)}`;
 
     const canvasEl = document.getElementById('canvas');

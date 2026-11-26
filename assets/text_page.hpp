@@ -358,8 +358,11 @@ inline constexpr std::string_view text_page =
       return state.text.slice(from, to);
     }
 
+    // The server puts an already percent-encoded URI path in ?path=, matching
+    // the raw request path, so it can be fetched verbatim. Re-encoding it here
+    // would turn %E7... into %25E7... and 404 on non-ASCII file names.
     const documentPath = new URLSearchParams(window.location.search).get('path') || '/';
-    const documentUrl = documentPath.split('/').map(encodeURIComponent).join('/') || '/';
+    const documentUrl = documentPath;
     const annotationsApiPath = `/api/annotations/text?path=${encodeURIComponent(documentPath)}`;
 
     const docEl = document.getElementById('document');
