@@ -2,7 +2,8 @@
 
 A tiny local web app for annotating **UTF-8 text files** and **raster images**
 in the browser. Source files are never modified: annotations live beside them in
-typed JSON sidecars, or only in memory with `--no-sidecar`.
+typed JSON sidecars, or kept in memory under `--no-sidecar` (existing sidecars
+are still read, never written).
 
 - **Text:** select text to highlight it, attach or edit comments, remove
   highlights.
@@ -60,7 +61,7 @@ txthighlight                              # serve the current directory on port 
 txthighlight notes.txt                    # open a UTF-8 text file
 txthighlight diagram.png                  # open a raster image
 txthighlight --host 0.0.0.0 --port 8080 ./docs
-txthighlight --no-sidecar ./notes         # annotate in memory only
+txthighlight --no-sidecar ./notes         # read sidecars, keep changes in memory
 ```
 
 | Option | Meaning |
@@ -68,7 +69,7 @@ txthighlight --no-sidecar ./notes         # annotate in memory only
 | `PATH` | UTF-8 text file, raster image (`png`, `jpg`/`jpeg`, `webp`, `gif`), or directory to serve (default: `.`). |
 | `--host HOST` | Interface to bind (default: `localhost`). |
 | `--port PORT` | TCP port (default: `8000`). |
-| `--no-sidecar` | Neither read nor write `<file>.json`; annotations last for the server's lifetime. |
+| `--no-sidecar` | Read existing `<file>.json` sidecars but never write them; new annotations last for the server's lifetime. |
 
 Open the printed URL. A file path downloads the file; `/annotate?path=...`
 opens its annotation UI; a directory renders a listing with Download links.
@@ -249,7 +250,8 @@ Each source file gets a sibling `<source>.json` holding exactly the JSON above.
 - Written atomically (`<source>.json.tmp` then `rename`).
 - Bound to the file name, so moving a directory keeps the pairs together.
 - A sidecar of the wrong `kind`, or with a malformed schema, fails with `400`.
-- `--no-sidecar` neither reads nor writes these files.
+- `--no-sidecar` still reads these files, but never writes them: an existing
+  sidecar seeds the in-memory state, and later changes last for the run only.
 
 ### In-memory representation
 
@@ -283,7 +285,9 @@ using AnnotationDocument = std::variant<TextAnnotationDocument, ImageAnnotationD
 | `PopupNoteAnnotation` | `x`, `y`, `text` |
 
 With `--no-sidecar`, `AppState` keeps a mutex-protected
-`std::map<std::string, AnnotationDocument>` in place of the files.
+`std::map<std::string, AnnotationDocument>` for new annotations. An existing
+sidecar is loaded on first access; once a path has an in-memory document, that
+document takes precedence over the sidecar. Nothing is written back.
 
 ## Third-party packages
 

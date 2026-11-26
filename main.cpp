@@ -1475,25 +1475,29 @@ struct AnnotationStatus {
 
 class AppState {
   public:
-    explicit AppState(const fs::path &root_path, bool use_sidecar = true)
+    explicit AppState(const fs::path &root_path, bool sidecar_writable = true)
         : root_path_(resolved_path(fs::absolute(root_path)).value_or(fs::absolute(root_path))),
-          use_sidecar_(use_sidecar) {}
+          sidecar_writable_(sidecar_writable) {}
 
     [[nodiscard]] const fs::path &root_path() const noexcept { return root_path_; }
 
-    [[nodiscard]] bool use_sidecar() const noexcept { return use_sidecar_; }
+    [[nodiscard]] bool sidecar_writable() const noexcept { return sidecar_writable_; }
 
     // Used by the directory listing. It never creates a sidecar and never
     // throws for a malformed one; the annotation view reports those loudly.
     [[nodiscard]] AnnotationStatus annotation_status(const fs::path &source_path) const {
-        if (!use_sidecar_) {
-            std::scoped_lock lock(mutex_);
-            const auto found = memory_documents_.find(source_path.string());
-            if (found == memory_documents_.end()) return {0, false};
-            return {document_size(found->second), false};
-        }
         const SidecarFile sidecar(source_path);
-        return {sidecar.annotation_count(), sidecar.exists()};
+        if (sidecar_writable_) return {sidecar.annotation_count(), sidecar.exists()};
+
+        // Read-only sidecars: an existing sidecar is still reported, but once
+        // this run has written an in-memory document it takes precedence.
+        const bool sidecar_present = sidecar.exists();
+        std::scoped_lock lock(mutex_);
+        const auto found = memory_documents_.find(source_path.string());
+        if (found == memory_documents_.end()) {
+            return {sidecar.annotation_count(), sidecar_present};
+        }
+        return {document_size(found->second), sidecar_present};
     }
 
     // Maps a URI path onto the filesystem, refusing anything outside the root.
@@ -1626,9 +1630,15 @@ class AppState {
     }
 
     template <class Document> [[nodiscard]] Document read_annotations(const fs::path &source_path) const {
-        if (use_sidecar_) return SidecarFile(source_path).template load_as<Document>();
+        if (sidecar_writable_) return SidecarFile(source_path).template load_as<Document>();
+
+        // Sidecars stay readable with --no-sidecar: an existing one seeds the
+        // in-memory state. After the first mutation, memory is authoritative so
+        // the run sees its own annotations rather than the stale sidecar.
         const auto found = memory_documents_.find(source_path.string());
-        if (found == memory_documents_.end()) return Document{};
+        if (found == memory_documents_.end()) {
+            return SidecarFile(source_path).template load_as<Document>();
+        }
         if (!std::holds_alternative<Document>(found->second)) {
             throw BadRequestError("Annotations for this path have a different kind: " +
                                   source_path.string());
@@ -1637,7 +1647,7 @@ class AppState {
     }
 
     template <class Document> void write_annotations(const fs::path &source_path, Document document) {
-        if (use_sidecar_) {
+        if (sidecar_writable_) {
             SidecarFile(source_path).save(AnnotationDocument{std::move(document)});
             return;
         }
@@ -1646,7 +1656,7 @@ class AppState {
 
     mutable std::mutex mutex_;
     fs::path root_path_;
-    bool use_sidecar_ = true;
+    bool sidecar_writable_ = true;
     std::map<std::string, AnnotationDocument> memory_documents_;
 };
 
@@ -1923,8 +1933,7 @@ struct EntryBadge {
     std::string text;
 };
 
-EntryBadge sidecar_badge(const AnnotationStatus &status, bool use_sidecar) {
-    if (!use_sidecar) return {"badge-sidecar", "sidecar (ignored)"};
+EntryBadge sidecar_badge(const AnnotationStatus &status) {
     if (status.count > 0) {
         return {"badge-sidecar", std::format("sidecar · {} annotation{}", status.count,
                                               status.count == 1 ? "" : "s")};
@@ -1938,32 +1947,33 @@ void replace_marker(std::string &text, std::string_view marker, std::string_view
     }
 }
 
-std::string render_sidecar_note(bool use_sidecar) {
-    return use_sidecar
+std::string render_sidecar_note(bool sidecar_writable) {
+    return sidecar_writable
                ? "Sidecars are enabled: annotations are saved next to each source file as "
                  "<code>&lt;file&gt;.json</code>; the source file itself is never modified."
-               : "<strong>Sidecars are disabled (<code>--no-sidecar</code>):</strong> "
-                 "annotations are kept in memory only and disappear when this server stops. "
-                 "Existing <code>.json</code> files are neither read nor written.";
+               : "<strong>Sidecars are read-only (<code>--no-sidecar</code>):</strong> "
+                 "existing <code>.json</code> files are loaded, but new annotations are kept "
+                 "in memory only and disappear when this server stops. No <code>.json</code> "
+                 "file is written.";
 }
 
-std::string render_api_docs(std::string_view docs, bool use_sidecar) {
+std::string render_api_docs(std::string_view docs, bool sidecar_writable) {
     std::string rendered(docs);
-    replace_marker(rendered, "<!-- SIDECAR_MODE -->", render_sidecar_note(use_sidecar));
+    replace_marker(rendered, "<!-- SIDECAR_MODE -->", render_sidecar_note(sidecar_writable));
     return rendered;
 }
 
-std::string render_text_page(bool use_sidecar) {
+std::string render_text_page(bool sidecar_writable) {
     std::string page(assets::text_page);
     replace_marker(page, "/* API_DOCS_STYLE */", assets::api_docs_style);
-    replace_marker(page, "<!-- API_DOCS -->", render_api_docs(assets::text_api_docs, use_sidecar));
+    replace_marker(page, "<!-- API_DOCS -->", render_api_docs(assets::text_api_docs, sidecar_writable));
     return page;
 }
 
-std::string render_image_page(bool use_sidecar) {
+std::string render_image_page(bool sidecar_writable) {
     std::string page(assets::image_page);
     replace_marker(page, "/* API_DOCS_STYLE */", assets::api_docs_style);
-    replace_marker(page, "<!-- API_DOCS -->", render_api_docs(assets::image_api_docs, use_sidecar));
+    replace_marker(page, "<!-- API_DOCS -->", render_api_docs(assets::image_api_docs, sidecar_writable));
     return page;
 }
 
@@ -2024,7 +2034,7 @@ std::string render_directory_listing(AppState &state, std::string_view raw_uri_p
         if (is_directory) {
             badge = {"badge-dir", "directory"};
         } else if (is_sidecar) {
-            badge = sidecar_badge(status, state.use_sidecar());
+            badge = sidecar_badge(status);
         } else if (status.count > 0) {
             badge = {"badge-annotated", std::format("annotated · {}", status.count)};
         } else if (has_raster_signature(entry_path)) {
@@ -2060,21 +2070,21 @@ std::string render_directory_listing(AppState &state, std::string_view raw_uri_p
         annotated_summary = std::format(
             "<p><strong>{} annotated file{} in this directory{}:</strong></p><ul>{}</ul>",
             annotated_file_count, annotated_file_count == 1 ? "" : "s",
-            state.use_sidecar() ? "" : " (in memory for this run)", annotated_items);
+            state.sidecar_writable() ? "" : " (in memory for this run)", annotated_items);
     } else {
-        annotated_summary = state.use_sidecar()
+        annotated_summary = state.sidecar_writable()
                                 ? "<p>No files in this directory are annotated yet.</p>"
-                                : "<p>No files in this directory have in-memory annotations yet. "
-                                  "Sidecars are disabled (<code>--no-sidecar</code>).</p>";
+                                : "<p>No files in this directory have annotations yet.</p>";
     }
-    if (!state.use_sidecar()) {
+    if (!state.sidecar_writable()) {
         annotated_summary +=
-            "<p>Existing <code>.json</code> sidecars are ignored in this run.</p>";
+            "<p>Existing <code>.json</code> sidecars are read but not modified in this run; "
+            "new annotations live in memory only.</p>";
     }
 
     return std::format(assets::directory_page, html_escape(display_path),
                        html_escape(root_path.string()), rows, annotated_summary,
-                       render_api_docs(assets::directory_api_docs, state.use_sidecar()),
+                       render_api_docs(assets::directory_api_docs, state.sidecar_writable()),
                        assets::api_docs_style);
 }
 
@@ -2107,8 +2117,8 @@ void handle_annotation_view(AppState &state, const std::string &document_path,
     }
 
     const auto is_image = std::holds_alternative<RasterImageDocument>(*document);
-    send_html(response, is_image ? render_image_page(state.use_sidecar())
-                                 : render_text_page(state.use_sidecar()));
+    send_html(response, is_image ? render_image_page(state.sidecar_writable())
+                                 : render_text_page(state.sidecar_writable()));
 }
 
 void handle_get(AppState &state, const httplib::Request &request, httplib::Response &response) {
@@ -2255,7 +2265,7 @@ extern "C" void handle_sigint(int) {
     if (active_server != nullptr) active_server->stop();
 }
 
-int serve(const std::string &raw_path, const std::string &host, int port, bool use_sidecar) {
+int serve(const std::string &raw_path, const std::string &host, int port, bool sidecar_writable) {
     const fs::path target = fs::absolute(fs::path(raw_path)).lexically_normal();
     std::error_code error;
     if (!fs::exists(target, error)) return fail("Path not found: " + target.string());
@@ -2271,9 +2281,10 @@ int serve(const std::string &raw_path, const std::string &host, int port, bool u
         print_line(std::cout, "Serving file {}", target.string());
     }
 
-    AppState state(root, use_sidecar);
-    if (!use_sidecar) {
-        print_line(std::cout, "Sidecars disabled: annotations are kept in memory for this run");
+    AppState state(root, sidecar_writable);
+    if (!sidecar_writable) {
+        print_line(std::cout, "Sidecars read-only: existing .json files are loaded, new "
+                              "annotations are kept in memory for this run");
     }
 
     httplib::Server server;
@@ -2372,8 +2383,8 @@ int main(int argc, char **argv) {
     app.add_option("--host", host, "Host interface to bind to")->capture_default_str();
     app.add_option("--port", port, "Port to listen on")->capture_default_str();
     app.add_flag("--no-sidecar", no_sidecar,
-                 "Do not read or write .json sidecar files; keep annotations in memory "
-                 "for this run");
+                 "Read existing .json sidecar files but never write them; keep new "
+                 "annotations in memory for this run");
 
     CLI11_PARSE(app, argc, argv);
     return serve(path, host, port, !no_sidecar);
